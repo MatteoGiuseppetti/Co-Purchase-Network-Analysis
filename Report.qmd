@@ -1,0 +1,625 @@
+---
+title: "Co-Purchase Network Analysis"
+format: pdf
+---
+
+```{r, echo=TRUE, eval=TRUE, warning=FALSE, message=FALSE}
+library(dplyr)
+library(igraph)
+library(readr)
+library(tidyr)
+library(janitor)
+library(purrr)
+library(ggplot2)
+library(sbm)
+library(gridExtra)
+library(ergm)
+library(ergm.count)
+library(network)
+library(intergraph)
+```
+This project analyses the DataCo Supply Chain dataset (https://data.mendeley.com/datasets/8gx2fvg2k6/5) to study how products are jointly purchased, modelling the catalogue as a co-purchase network. We retain only the variables used in the subsequent models — customer_segment (type), days_for_shipment_scheduled, order_item_discount_rate, order_item_total, order_customer_id, customer_city, product_price, and category_name — discarding the rest to keep the analysis focused. Each node represents a product, and an undirected edge links two products that appear together in at least one order, weighted by the number of orders in which they co-occur. The goal is to describe the structure of these purchasing relations and to identify latent product groups and the product/order characteristics that drive joint purchasing.
+```{r, echo=FALSE, eval=TRUE, warning=FALSE, message=FALSE}
+data <- read_csv(
+  "data/DataCoSupplyChainDataset.csv", show_col_types = FALSE
+) %>%
+  clean_names()
+```
+```{r, echo=FALSE, eval=TRUE, warning=FALSE, message=FALSE}
+model_data <- data |>
+  select(c(
+      "customer_segment",
+      "type",
+      "days_for_shipment_scheduled",
+      "order_item_discount_rate",
+      "order_item_total",
+      "order_customer_id",
+      "customer_city",
+      "product_price",
+      "category_name",
+      "order_id",
+      "product_card_id"
+    )
+  )
+```
+```{r, echo=FALSE, eval=TRUE, warning=FALSE, message=FALSE}
+df <- model_data |>
+  select(order_id, product_card_id) |>
+  distinct()
+
+edges <- df |>
+  inner_join(df, by = "order_id", suffix = c("_a", "_b")) |>
+  filter(product_card_id_a < product_card_id_b) |>
+  count(product_card_id_a, product_card_id_b, name = "weight")
+g <- graph_from_data_frame(
+  d        = edges |> rename(from = product_card_id_a, to = product_card_id_b),
+  directed = FALSE,
+  vertices = data.frame(name = sort(unique(df$product_card_id)))
+)
+
+E(g)$weight <-edges$weight
+```
+```{r, echo=FALSE, eval=TRUE, warning=FALSE, message=FALSE}
+comp <- components(g)
+
+big_comp <- induced_subgraph(
+  g,
+  vids = V(g)[comp$membership == which.max(comp$csize)]
+)
+
+par(mfrow = c(1, 2))
+
+plot(
+  g,
+  main = "Full co-purchase network"
+)
+
+plot(
+  big_comp,
+  main = "Giant component"
+)
+
+par(mfrow = c(1, 1))
+```
+The plot compares the full co-purchase network with its giant component. In the full network, each node represents a product and each edge represents a co-purchase relationship between two products, with thicker edges indicating more frequent co-purchases. The plot shows that some products are disconnected from the main structure: these products either appear as isolated nodes or belong to very small separated components, meaning that they do not share co-purchase links with the main group of products.
+
+For the subsequent analysis, we therefore focus on the giant component, which is the largest connected part of the network.  The giant component reveals a dense core of products that are frequently co-purchased with many others, surrounded by more peripheral products with fewer or weaker connections. From a business perspective, the central area may indicate products with broader market relevance or bundle potential, while peripheral products may represent more niche or specialized purchasing patterns.
+
+# Descriptive Network Analysis
+After constructing the co-purchase network and restricting the analysis to the giant component, we describe its main structural properties.
+```{r, echo=FALSE, eval=TRUE, warning=FALSE, message=FALSE}
+deg <- degree(big_comp)
+
+dd <- degree_distribution(big_comp)
+k  <- 0:(length(dd) - 1)
+
+n_nodes <- vcount(big_comp)
+p_hat   <- ecount(big_comp) / choose(vcount(big_comp),2)
+
+binom_fit <- dbinom(k, size = n_nodes - 1, prob = p_hat)
+
+# Strength distribution
+st <- strength(big_comp, weights = E(big_comp)$weight)
+
+# Plot
+old_par <- par(
+  mfrow = c(1, 2),
+  mar   = c(4, 4, 3, 1),
+  cex   = 0.8
+)
+
+# 1. Degree + Binomial
+plot(
+  k, dd,
+  type = "h",
+  lwd  = 2,
+  col  = "darkred",
+  main = "Degree + Binomial",
+  xlab = "Degree k",
+  ylab = "P(k)"
+)
+
+points(k, dd, pch = 19, col = "darkred", cex = 0.45)
+
+lines(k, binom_fit, col = "darkgreen", lwd = 2)
+
+legend(
+  "topright",
+  legend = c("Observed", "Binomial"),
+  col    = c("darkred", "darkgreen"),
+  pch    = c(19, NA),
+  lwd    = c(NA, 2),
+  bty    = "n",
+  cex    = 0.7
+)
+
+# 2. Histogram of log-strength
+hist(
+  st,
+  breaks = 15,
+  col    = "grey80",
+  border = "white",
+  main   = "Distribution of strength",
+  xlab   = "Strength",
+  ylab   = "Number of products"
+)
+
+par(old_par)
+```
+The degree distribution does not closely follow the binomial benchmark, suggesting that the co-purchase network is not homogeneous: products do not all have a similar number of connections. This heterogeneity is even clearer in the strength distribution, where most products have low total co-purchase intensity, while only a few products have very high strength. Therefore, the network is dominated by a small set of highly connected and commercially central products, while most items play a more peripheral role.
+
+To evaluate the business role of products in the co-purchase network, we compute several centrality measures, each capturing a different notion of product importance. Strength measures the total intensity of co-purchases involving each product and is therefore interpreted as the main indicator of commercial importance. Closeness centrality captures how easily a product can be reached from the rest of the catalogue through co-purchase paths, while betweenness centrality identifies products acting as bridges between different areas of demand, which may be relevant for cross-selling opportunities. PageRank and eigenvector centrality measure recursive importance, assigning higher scores to products connected to other important products. Since these measures may lead to overlapping managerial conclusions, we first compute all of them and then assess redundancy using Spearman rank correlations and top-ranking overlap. Only non-redundant measures are retained in the final interpretation.
+```{r, echo=FALSE, eval=TRUE, warning=FALSE, message=FALSE}
+E(big_comp)$dist_weight <- 1 / E(big_comp)$weight
+
+# Product-level information
+product_info <- data |>
+  mutate(product_card_id = as.character(product_card_id)) |>
+  group_by(product_card_id) |>
+  summarise(
+    product_name  = first(na.omit(product_name)),
+    category_name = first(na.omit(category_name)),
+    n_orders      = n_distinct(order_id),
+    .groups = "drop"
+  )
+
+# Centrality measures
+centrality_tbl <- tibble(
+  product_card_id = V(big_comp)$name,
+
+  degree = degree(big_comp),
+
+  strength = strength(
+    big_comp,
+    weights = E(big_comp)$weight
+  ),
+
+  closeness = closeness(
+    big_comp,
+    weights = E(big_comp)$dist_weight,
+    normalized = TRUE
+  ),
+
+  betweenness = betweenness(
+    big_comp,
+    weights = E(big_comp)$dist_weight,
+    normalized = TRUE
+  ),
+
+  pagerank = page_rank(
+    big_comp,
+    weights = E(big_comp)$weight
+  )$vector,
+
+  bonacich_eigenvector = eigen_centrality(
+    big_comp,
+    directed = FALSE,
+    weights = E(big_comp)$weight
+  )$vector
+) |>
+  left_join(product_info, by = "product_card_id") |>
+  relocate(product_name, category_name, n_orders, .after = product_card_id)
+
+# Redundancy check between centrality measures
+centrality_cor_spearman <- centrality_tbl |>
+  select(
+    strength,
+    closeness,
+    betweenness,
+    pagerank,
+    bonacich_eigenvector
+  ) |>
+  cor(
+    use = "pairwise.complete.obs",
+    method = "spearman"
+  ) |>
+  round(3)
+
+top_ids <- list(
+  strength = centrality_tbl |>
+    arrange(desc(strength)) |>
+    slice_head(n = 10) |>
+    pull(product_card_id),
+
+  closeness = centrality_tbl |>
+    arrange(desc(closeness)) |>
+    slice_head(n = 10) |>
+    pull(product_card_id),
+
+  betweenness = centrality_tbl |>
+    arrange(desc(betweenness)) |>
+    slice_head(n = 10) |>
+    pull(product_card_id),
+
+  pagerank = centrality_tbl |>
+    arrange(desc(pagerank)) |>
+    slice_head(n = 10) |>
+    pull(product_card_id),
+
+  bonacich_eigenvector = centrality_tbl |>
+    arrange(desc(bonacich_eigenvector)) |>
+    slice_head(n = 10) |>
+    pull(product_card_id)
+)
+
+metric_redundancy <- tibble(
+  metric = c(
+    "closeness",
+    "betweenness",
+    "pagerank",
+    "bonacich_eigenvector"
+  ),
+
+  spearman_with_strength = c(
+    centrality_cor_spearman["strength", "closeness"],
+    centrality_cor_spearman["strength", "betweenness"],
+    centrality_cor_spearman["strength", "pagerank"],
+    centrality_cor_spearman["strength", "bonacich_eigenvector"]
+  ),
+
+  common_top10_with_strength = c(
+    length(intersect(top_ids$strength, top_ids$closeness)),
+    length(intersect(top_ids$strength, top_ids$betweenness)),
+    length(intersect(top_ids$strength, top_ids$pagerank)),
+    length(intersect(top_ids$strength, top_ids$bonacich_eigenvector))
+  )
+)
+
+metric_redundancy
+```
+The redundancy check shows that PageRank and Bonacich/eigenvector centrality are almost identical to strength in terms of product ranking. Closeness is also highly redundant with strength, with a very high Spearman correlation and strong top-10 overlap. Therefore, strength is reported as the main measure of co-purchase importance, since it directly captures the total intensity of co-purchases. Betweenness is retained as a complementary measure: although it still overlaps with strength, it is less redundant and has a different interpretation, identifying products that act as bridges between different parts of the co-purchase network. For weighted measures, the original co-purchase weight is used for strength, PageRank and Bonacich/eigenvector centrality, while the inverse weight is used for closeness and betweenness because shortest-path measures require weights to represent distances.
+```{r, echo=FALSE, eval=TRUE, warning=FALSE, message=FALSE}
+centrality_report <- centrality_tbl |>
+  mutate(
+    rank_betweenness = rank(-betweenness, ties.method = "min")
+  ) |>
+  arrange(desc(strength)) |>
+  select(
+    product_name,
+    category_name,
+    n_orders,
+    strength,
+    rank_betweenness
+  ) |>
+  slice_head(n = 10)
+
+centrality_report
+```
+
+The top products by strength are mainly high-volume items from sport, footwear and outdoor-related categories. From a business perspective, these products represent the core of the co-purchase network: they are frequently bought together with other products and therefore have strong potential for recommendations, bundle design and prominent placement in the catalogue. The betweenness ranks are also very high for almost all these products, indicating that the most commercially central items are not only frequently co-purchased, but also help connect different purchasing areas. This suggests that cross-selling strategies can be built around these products, using them as entry points to link related categories such as footwear, outdoor equipment, fishing, water sports and camping. The last product, Nike Men's Comfort 2 Slide, has much lower order volume and strength, but still appears among the relevant bridge products; this may indicate a more niche product with potential to connect specific purchasing patterns, although it should be interpreted with more caution because of its lower volume.
+```{r}
+edge_density(big_comp)
+transitivity(big_comp)
+```
+The giant component has a relatively high density of 0.376, meaning that many possible product pairs are directly connected by co-purchases. The transitivity value of 0.637 also indicates strong local clustering: products connected to the same product tend to be connected to each other as well. From a business perspective, this suggests the presence of cohesive groups of related products, which can be useful for bundle design and cross-selling strategies.
+
+# Sampling methods
+
+The product co-purchase network contains 100 nodes and 1861 edges, so sampling is not needed for computational reasons. Instead, it is used as a sensitivity analysis: the statistic computed on the full graph is compared with the same statistic computed on sampled subgraphs, in order to assess how different sampling designs distort the observed co-purchase structure.
+
+The main statistic is average strength. Since edge weights represent how many times two products are bought together, strength is more appropriate than degree for this objective: degree only counts the number of connected products, while strength also captures the intensity of co-purchase relations.
+
+Other measures are less suitable as the main sampling statistic. Closeness and betweenness depend on shortest paths and are therefore more sensitive to missing or sampled edges, while clustering focuses on triangles rather than purchase frequency. Path sampling is also excluded because it samples paths between selected source and target nodes, which is more appropriate when the object of interest is movement or routing through the network. In this project, the target statistic is average strength, based on direct weighted co-purchase relations; path sampling would overrepresent products and edges lying on many shortest paths rather than the overall intensity of co-purchases. The analysis therefore focuses on induced, incident and snowball sampling, which better represent partial observation of products or co-purchase relations.
+
+```{r, echo=FALSE, eval=TRUE, warning=FALSE, message=FALSE}
+avg_strength <- function(g) {
+  if (ecount(g) == 0) return(0)
+  mean(strength(g, weights = E(g)$weight))
+}
+
+snowball_2 <- function(g) {
+  frontier <- sample(seq_len(vcount(g)), 1)
+  reached  <- frontier
+  e_ids    <- integer(0)
+  
+  for (w in 1:2) {
+    inc <- E(g)[.inc(V(g)[frontier])]
+    e_ids <- unique(c(e_ids, as.integer(inc)))
+    
+    new_nodes <- setdiff(unique(as.integer(ends(g, inc, names = FALSE))), reached)
+    reached  <- unique(c(reached, new_nodes))
+    frontier <- new_nodes
+    
+    if (length(frontier) == 0) break
+  }
+  
+  subgraph_from_edges(g, E(g)[e_ids], delete.vertices = TRUE)
+}
+
+set.seed(123)
+
+true_value <- avg_strength(big_comp)
+nmc <- 400
+n_v <- floor(0.25 * vcount(big_comp))
+n_e <- floor(0.10 * ecount(big_comp))
+
+est_mc <- map_dfr(seq_len(nmc), \(mc) {
+  
+  sampled_graphs <- list(
+    Induced  = induced_subgraph(big_comp, sample(V(big_comp), n_v)),
+    Incident = subgraph_from_edges(big_comp, sample(E(big_comp), n_e), delete.vertices = TRUE),
+    Snowball = snowball_2(big_comp)
+  )
+  
+  tibble(
+    mc = mc,
+    method = names(sampled_graphs),
+    estimate = map_dbl(sampled_graphs, avg_strength)
+  )
+})
+
+ggplot(est_mc, aes(x = estimate, fill = method)) +
+  geom_histogram(bins = 40, alpha = 0.45, position = "identity") +
+  geom_vline(xintercept = true_value, linewidth = 1) +
+  labs(
+    title = "Average strength under different sampling methods",
+    subtitle = "Vertical line = average strength of the full network",
+    x = "Average strength",
+    y = "Count"
+  ) +
+  theme_minimal()
+```
+The sampling experiment shows that the estimated average strength strongly depends on the sampling design. Both induced and incident sampling tend to underestimate the average strength of the full co-purchase network, suggesting that partial observation of products or edges can make co-purchase intensity appear much weaker than it actually is. Induced sampling is especially unstable, because selecting only a subset of products removes many co-purchase relations among non-sampled products. Incident sampling is more concentrated, but still far below the full-network value because only a small fraction of edges is observed. In contrast, two-wave snowball sampling produces estimates very close to the full-network average strength. This happens because, in a dense co-purchase network, expanding from one product to its neighbors and then to their neighbors quickly captures a large part of the relevant co-purchase structure. From a business perspective, this means that local exploration around a product can preserve the main purchasing intensity better than random partial observation, while induced and incident samples may underestimate the real strength of product associations.
+
+
+# Stochastic Blockmodel
+
+The next question is whether products can be divided into latent groups according to their co-purchase patterns. This is the purpose of the stochastic blockmodel: each node is assigned to an unobserved block, and the model estimates the probability of connection within and between blocks. In this sense, the SBM is well aligned with the objective of identifying groups of products that play similar roles in the co-purchase network, based on their connection profiles. Alternative approaches, such as latent position models or modularity-based clustering, could also be used, but they either add unnecessary complexity or provide a more algorithmic partition without the same explicit probabilistic interpretation of between-block relations.
+
+A weighted SBM was also considered, using co-purchase counts as edge weights and a Poisson specification. However, this model was strongly driven by a small group of very frequently purchased products. As a result, the blocks mainly reflected differences in co-purchase intensity rather than broader patterns of product association, producing one very small but extremely intense block and other blocks with much lower interaction levels. For this reason, the weighted SBM was less useful for the main objective of the project. The final analysis therefore focuses on a binary SBM, where an edge indicates whether two products were purchased together at least once. This reduces the dominance of very popular products and gives a clearer interpretation of latent product groups based on the overall co-purchase structure.
+
+
+```{r}
+# Binary adjacency matrix from the giant component
+A <- as_adjacency_matrix(big_comp, sparse = FALSE)
+A <- 1 * (A > 0)
+diag(A) <- 0
+
+# Binary SBM
+set.seed(123)
+
+sm_bin <- estimateSimpleSBM(
+  A,
+  model = "bernoulli",
+  estimOptions = list(exploreMax = 10, plot = FALSE, verbosity = 0)
+)
+
+block_sizes_bin <- as.data.frame(table(sm_bin$memberships))
+names(block_sizes_bin) <- c("block", "n_products")
+
+pi_bin <- coef(sm_bin)$mean
+
+block_sizes_bin
+```
+
+The binary SBM identifies four latent blocks in the giant component. Block 2 is the largest group, with 45 products, followed by Block 3 with 33 products. Blocks 1 and 4 are smaller, with 9 and 13 products respectively. This suggests that the network contains two broad product groups and two more specific groups. However, block size alone does not determine the business role of each group; the interpretation also depends on the estimated within- and between-block connection probabilities and on the product categories represented in each block.
+```{r, echo=FALSE, eval=TRUE, warning=FALSE, message=FALSE}
+# Product-level information
+product_info_bin <- data |>
+  mutate(product_card_id = as.character(product_card_id)) |>
+  group_by(product_card_id) |>
+  summarise(
+    product_name    = first(na.omit(product_name), default = NA_character_),
+    category_name   = first(na.omit(category_name), default = NA_character_),
+    department_name = first(na.omit(department_name), default = NA_character_),
+    product_price   = mean(product_price, na.rm = TRUE),
+    n_orders        = n_distinct(order_id),
+    sales           = sum(sales, na.rm = TRUE),
+    .groups         = "drop"
+  )
+
+# SBM membership + product information
+sbm_products_bin <- data.frame(
+  product_card_id = as.character(V(big_comp)$name),
+  block           = sm_bin$memberships,
+  degree          = degree(big_comp)
+) |>
+  left_join(product_info_bin, by = "product_card_id")
+
+# Block-level profile
+block_profile_bin <- sbm_products_bin |>
+  group_by(block) |>
+  summarise(
+    n_products      = n(),
+    avg_price       = mean(product_price, na.rm = TRUE),
+    total_orders    = sum(n_orders, na.rm = TRUE),
+    total_sales     = sum(sales, na.rm = TRUE),
+    main_category   = names(sort(table(category_name), decreasing = TRUE))[1],
+    main_department = names(sort(table(department_name), decreasing = TRUE))[1],
+    .groups         = "drop"
+  )
+
+# Top products within each SBM block
+top_products_bin <- sbm_products_bin |>
+  arrange(block, desc(degree)) |>
+  group_by(block) |>
+  slice_max(degree, n = 3, with_ties = FALSE) |>
+  ungroup() |>
+  select(
+    block,
+    product_card_id,
+    product_name,
+    category_name,
+    department_name,
+    n_orders,
+    sales,
+    degree
+  )
+
+block_profile_bin
+```
+The binary SBM identifies four product blocks with different business profiles. Block 1 is small, with only 9 products, but it has by far the highest order volume and sales. This suggests a core group of highly popular products that are broadly connected across the catalogue and likely drive a large share of co-purchase activity. From a business perspective, these products are key candidates for prominent placement and recommendation strategies.
+
+Block 2 is the largest group, with 45 products, but it has much lower average price and sales. This block appears to represent a broad set of lower-value or add-on products, mainly from categories such as electronics, accessories and golf-related items. These products may be useful for complementary recommendations and basket expansion.
+
+Blocks 3 and 4 are smaller and have lower demand, but they differ in price level. Block 3 contains medium/high-price products mostly related to golf and outdoor activities, while Block 4 has the highest average price and appears to capture a more premium or specialized niche. These blocks may be relevant for targeted cross-selling rather than mass-market recommendations.
+
+```{r, echo=FALSE, eval=TRUE, warning=FALSE, message=FALSE}
+print(top_products_bin, width = Inf)
+```
+The most connected products within each block provide a clearer interpretation of the SBM groups. In Block 1, the top products all have degree 99, meaning that they are connected to every other product in the giant component. This confirms that Block 1 represents a core group of highly central and commercially important products, also supported by their very high order volumes and sales. In contrast, the most connected products in Blocks 2, 3 and 4 have much lower degrees, respectively around 50, 25–27 and 14–16. These blocks therefore appear to capture more specific product groups, with meaningful but more limited co-purchase connections. From a business perspective, Block 1 contains products suitable for broad recommendation and visibility strategies, while the other blocks are better interpreted as more targeted groups for complementary or niche cross-selling.
+```{r, echo=FALSE, eval=TRUE, warning=FALSE, message=FALSE}
+# Plots side by side
+old_par <- par(
+  mfrow = c(1, 2),
+  mar = c(4, 4, 3, 1),
+  cex = 0.75
+)
+
+# Plot 1: network coloured by SBM block
+g_plot_bin <- big_comp
+V(g_plot_bin)$block <- factor(sm_bin$memberships)
+
+block_cols <- colorRampPalette(
+  c("orange", "skyblue", "seagreen3", "gold", "orchid", "tomato")
+)(nlevels(V(g_plot_bin)$block))
+
+V(g_plot_bin)$color <- block_cols[as.integer(V(g_plot_bin)$block)]
+
+set.seed(123)
+lay_bin <- layout_with_fr(g_plot_bin)
+
+plot(
+  g_plot_bin,
+  layout = lay_bin,
+  vertex.label = NA,
+  vertex.size = 4,
+  vertex.color = V(g_plot_bin)$color,
+  vertex.frame.color = "gray30",
+  edge.width = 0.4,
+  edge.color = "gray75",
+  main = "Binary SBM network"
+)
+
+legend(
+  "topright",
+  legend = paste("B", levels(V(g_plot_bin)$block)),
+  col = block_cols,
+  pch = 19,
+  bty = "n",
+  cex = 0.6
+)
+
+# Plot 2: SBM probability matrix
+Q <- nrow(pi_bin)
+
+image(
+  1:Q, 1:Q, t(pi_bin),
+  col = grey.colors(100, 1, 0),
+  axes = FALSE,
+  xlab = "Block",
+  ylab = "Block",
+  main = "SBM probability matrix"
+)
+
+axis(1, at = 1:Q, labels = 1:Q)
+axis(2, at = 1:Q, labels = 1:Q)
+
+for (i in 1:Q) {
+  for (j in 1:Q) {
+    text_col <- ifelse(pi_bin[i, j] > 0.5, "white", "black")
+    
+    text(
+      x = j,
+      y = i,
+      labels = round(pi_bin[i, j], 2),
+      cex = 0.75,
+      col = text_col,
+      font = 2
+    )
+  }
+}
+
+par(old_par)
+```
+The network plot and the probability matrix provide a structural interpretation of the SBM results. The network visualization shows that Block 1 is located at the center of the graph and is highly connected to the other blocks, suggesting that it acts as a core group of products. The other blocks are more separated and form more peripheral groups.
+The binary SBM reveals a clear core-periphery structure in the co-purchase network. Although Block 2 is the largest block in terms of number of products, Block 1 plays the central structural role. The probability matrix shows that Block 1 has very high connection probabilities both within the block and with all other blocks. This indicates a small core of products that are strongly connected to each other and also link the rest of the catalogue.
+
+The other blocks are more peripheral and specialized. Blocks 2, 3 and 4 have very low connection probabilities with each other, meaning that they are not directly connected strongly, but mainly interact through the core block. From a business perspective, Block 1 contains strategic products for recommendations and cross-selling across different product groups, while the other blocks represent more specific purchasing areas that can be targeted with more focused bundle or category-level strategies.
+```{r, echo=TRUE, eval=TRUE, warning=FALSE, message=FALSE}
+# Goodness-of-fit checks for the binary SBM
+p_obs <- plot(sm_bin, "data")
+p_exp <- plot(sm_bin, "expected")
+
+grid.arrange(
+  p_obs,
+  p_exp,
+  ncol = 2
+)
+```
+As a goodness-of-fit check, the observed adjacency matrix was compared with the expected adjacency matrix under the fitted SBM. The observed matrix shows a clear block structure, with one small block that is strongly connected to the rest of the network and other blocks that are mostly internally connected. The expected matrix reproduces this general pattern: high connection probabilities are concentrated within some blocks and between the central block and the others, while direct connections between the peripheral blocks are expected to be very rare.
+
+The comparison suggests that the binary SBM captures the main connectivity structure of the product co-purchase network. However, the observed matrix is naturally more irregular than the expected one, since the expected matrix represents a smoothed model-based approximation rather than the exact observed edges.
+
+# Exponential random graph model
+
+In the final stage of the analysis, we investigate whether covariate information and characteristics for nodes influence the expected co-purchasing frequency between pairs of products. We estimate an Exponential Random Graph Model (ERGM), where nodes represent individual products and weighted edges correspond to the number of times two products were purchased together within the same customer order. Because edge values are non-negative counts, the model is estimated using a Poisson reference distribution.
+The following vertex attributes are considered: **product_price** as unit price of the product expressed in dollars; **order_item_discount_rate** as the discount rate applied to the product, expressed in percentage; **category_name** as the categorical variable identifying the product category; **days_for_shipment_scheduled** as the scheduled delivery time expressed in days.  
+These covariates allow us to assess whether similarity in product characteristics, pricing structure, discount policies, or logistical features affect the likelihood of joint purchasing behavior.
+```{r}
+summary(model_data$days_for_shipment_scheduled)
+table(model_data$category_name)
+summary(model_data$order_item_discount_rate)
+summary(model_data$product_price)
+
+# convert graph from igraph to network
+net <- asNetwork(big_comp)
+set.edge.attribute(net,"count", E(big_comp)$weight)
+set.vertex.attribute(net, "Scheduled_Delivery", model_data$days_for_shipment_scheduled)
+set.vertex.attribute(net, "Prod_category", model_data$category_name)
+set.vertex.attribute(net, "Discount", model_data$order_item_discount_rate)
+set.vertex.attribute(net, "Item_price" , model_data$product_price)
+
+net %v% "Item_price" <- as.numeric(scale(net %v% "Item_price"))
+net %v% "Discount" <- as.numeric(scale(net %v% "Discount"))
+net %v% "Scheduled_Delivery" <- as.numeric(scale(net %v% "Scheduled_Delivery"))
+```
+
+We can fit the ERGM model specyifing the intercept and how we want to measure the effect of the covariates on the logarithm of the expected count of co-purchase between two nodes: **nonzero** intercept controls the sparsity of the graph, counting how many dyads have an edge with a count greater than zero; **absdiff("Item_price")** measure the effect of absolute difference of the standardized price between two products, it evaluates whether products with similar or dissimilar prices tend to be purchased together more frequently; **nodecov("Discount")** capture the additive effect of standardized discount by summing it across two connected nodes;**nodematch("Prod_category")** measures whether products belonging to the same category are more likely to be jointly purchased; **absdiff("Scheduled_Delivery")** effect of the absolute difference in scheduled delivery times between products, it assesses whether substantial difference in delivery scheduling influence co-purchasing intensity.
+```{r, echo=TRUE, results='hide', message=FALSE, warning=FALSE}
+model2 <- ergm(net ~ nonzero + absdiff("Item_price") +nodecov("Discount") +
+            nodematch("Prod_category") + absdiff("Scheduled_Delivery"),
+            response = "count",reference = ~Poisson,
+            control = control.ergm(MCMC.burnin = 20000,
+            MCMC.interval = 1000,MCMC.samplesize = 5000))
+```
+
+```{r}
+summary(model2)
+```
+The estimated coefficients are interpreted on the logarithmic scale because the Poisson-reference ERGM uses a log-link function for the expected edge count:  
+- nonzero = -10.439909: the large negative value reflects the network's sparsity.
+- absdiff.sum.Item_price = +1.181406: it's the increase of the log expected co-purchase count for every one standard deviation increase in the absolute price difference between two products, holding all other effects constant. Products that are more dissimilar in price are bought together more often; highly significant.
+- nodecov.sum.Discount = -0.448541: higher combined discount is associated with lower expected co-purchase frequencies. This may reflect that discounted items are impulse purchases added alone; highly significant;
+- nodematch.sum.Prod_category: +2.410 = when two products belong to the same category they are purchased more than cross-category pairs; highly significant;
+- absdiff("Scheduled_Delivery") = 0.323407: one standard deviation increase in delivery-time disparity increases the expected co-purchase count by approximately $\exp(1.18) \approx 1.38$.  
+
+MCMC diagnostics were examined to verify convergence and adequate mixing of the Markov chains used for maximum likelihood estimation.
+```{r}
+par(mfrow = c(2, 2))
+invisible(capture.output(
+  mcmc.diagnostics(model2)
+))
+```
+Both traces show the chain fluctuating around a stable horizontal mean throughout all iterations, indicating stationarity of the chain. The Scheduled_delivery trace shows slightly more volatility towards the end, but in general the variance looks consistent across the full runs of both quantitative features.  
+Finally, we would like to test if a smaller nested model can explain the same amount of deviance.
+
+```{r, echo=TRUE, results='hide', message=FALSE, warning=FALSE}
+model_small <- ergm(net ~ nonzero +
+                      nodematch("Prod_category"),
+                    response = "count",
+                    reference = ~Poisson,
+                    control = control.ergm(
+                      MCMC.burnin = 20000,
+                      MCMC.interval = 1000,
+                      MCMC.samplesize = 5000
+                    )
+)
+```
+
+```{r}
+anova(model_small, model2)
+```
+
+The resulting p-value is significantly below  the significance level $\alpha$ = 0.05, indicating that the reduced model provides a significantly worse fit. This suggests that including the discount rate, expected delivery time, and price difference improves the model’s ability to explain the observed network structure.
+
